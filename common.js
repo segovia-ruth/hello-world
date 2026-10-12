@@ -10,7 +10,17 @@ if (document.body.dataset.loginRequired === 'true') {
     const url = new URL(args[0] instanceof Request ? args[0].url : args[0], location.href);
     const redirectedToLogin = response.redirected && response.url &&
       ['/', '/login'].includes(new URL(response.url).pathname);
-    if (url.origin === location.origin && (response.status === 401 || redirectedToLogin)) location.assign('/login');
+    if (url.origin === location.origin && (response.status === 401 || redirectedToLogin)) {
+      // A 401 can also mean "wrong role for this endpoint" (e.g. an instructor session hitting a
+      // student-only API such as /api/student/active_assignments), not an expired login. Only
+      // leave the page when /api/me confirms the session is really gone.
+      if (redirectedToLogin || url.pathname === '/api/me') { location.assign('/login'); return response; }
+      try {
+        const me = await originalFetch('/api/me', { headers: { Accept: 'application/json' } });
+        const info = me.ok ? await me.json() : null;
+        if (!info || info.logged_in === false) location.assign('/login');
+      } catch { /* network hiccup: stay on the page */ }
+    }
     return response;
   };
 }
