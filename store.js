@@ -185,6 +185,38 @@ document.addEventListener('alpine:init', () => {
       fetch(`/api/classes/${c.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: c.name, term: newTerm }) })
         .catch(() => console.warn('PATCH /api/classes/:id not available; keeping local term update.'));
     },
+    async deleteClass(c) {
+      if (this.isTA) return;
+      if (!confirm(`Delete course "${c.name || 'Untitled Class'}"?\n\nThis permanently removes the course, its assignments, files, roster and tutoring chats. This cannot be undone.`)) return;
+      try {
+        const res = await fetch(`/api/classes/${encodeURIComponent(c.id)}`, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) throw new Error(data.error || `Delete failed (${res.status})`);
+        if (this.currentClassId === c.id) {
+          this.currentClassId = null; this.currentClassName = ''; this.currentAsnId = null;
+          this.assignments = []; this.files = []; this.rosterHtml = '';
+        }
+        delete this.sidebarAsn[c.id];
+        if (this.sidebarExpandedClass === c.id) this.sidebarExpandedClass = null;
+        showNotification('Course deleted.');
+        if (document.documentElement.classList.contains('course-mode')) { location.href = '/courses'; return; }
+        await this.loadClasses();
+      } catch (e) { showNotification(e.message || 'Could not delete course.', true); }
+    },
+    async deleteSidebarAsn(classId, a) {
+      if (!this.canManageAssignments) return;
+      if (!confirm(`Delete assignment "${a.title}"?\n\nThis permanently removes its files, tutoring chats and links. This cannot be undone.`)) return;
+      try {
+        const res = await fetch(`/api/instructor/assignments/${encodeURIComponent(a.id)}`, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) throw new Error(data.error || `Delete failed (${res.status})`);
+        if (this.currentAsnId === a.id) { this.currentAsnId = null; this.files = []; this.remarks = ''; }
+        this.activeTitleSet = this.activeTitleSet.filter(t => t !== a.title);
+        showNotification('Assignment deleted.');
+        if (classId === this.currentClassId) await this.loadAssignments(classId);
+        await this.loadSidebarAsn(classId);
+      } catch (e) { showNotification(e.message || 'Could not delete assignment.', true); }
+    },
     toggleClassActive(c) {
       fetch(`/api/classes/${c.id}/toggle_active`, { method: 'POST' }).then(r => r.json()).then(data => {
         if (data.ok) { c.is_active = data.is_active; showNotification(data.is_active ? 'Course activated.' : 'Course deactivated.'); }
@@ -215,6 +247,21 @@ document.addEventListener('alpine:init', () => {
       fetch(`/api/instructor/assignments/${a.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: newTitle }) })
         .catch(() => console.warn('PATCH /api/instructor/assignments/:id not available; keeping local rename.'))
         .finally(() => { if (classId === this.currentClassId) this.loadAssignments(classId); });
+    },
+    async setSidebarAsnDue(classId, a, dueDate, dueTime) {
+      const prev = { d: a.due_date, t: a.due_time };
+      a.due_date = dueDate || null;
+      a.due_time = dueDate ? (dueTime || null) : null;
+      try {
+        const res = await fetch(`/api/instructor/assignments/${encodeURIComponent(a.id)}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ due_date: a.due_date, due_time: a.due_time }) });
+        if (!res.ok) throw new Error('save failed');
+        showNotification(a.due_date ? 'Due date saved.' : 'Due date cleared.');
+      } catch (e) {
+        a.due_date = prev.d; a.due_time = prev.t;
+        showNotification('Could not save due date.', true);
+      }
     },
     async toggleSidebarAsnActive(classId, a, makeActive) {
       try {

@@ -7,7 +7,10 @@ Open http://127.0.0.1:5000. Edit templates/ and static/, then refresh.
 import argparse
 import json
 import logging
+import re
+import threading
 from http.cookies import SimpleCookie
+from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
@@ -20,7 +23,6 @@ from localweb_context import ContextError, page_context, roster_context
 UPSTREAM = "https://leaftutor.org"
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailer", "transfer-encoding", "upgrade"}
-
 
 
 def local_url(value, upstream):
@@ -56,7 +58,9 @@ def local_cookie(value):
 def create_app(upstream=UPSTREAM, transport=None):
     app = Flask(__name__)
     app.config.update(UPSTREAM=upstream.rstrip("/"), SEND_FILE_MAX_AGE_DEFAULT=0,
-                      TEMPLATES_AUTO_RELOAD=True)
+                      TEMPLATES_AUTO_RELOAD=True,
+                      # Due dates live here because the real backend has no due-date field.
+                      DUE_FILE=str(Path(__file__).with_name("due_dates.json")))
     # Independent requests: no global cookie jar shared between users.
     app.config["UPSTREAM_TRANSPORT"] = transport or requests.request
     app.jinja_env.globals["static_v"] = lambda path: url_for(
@@ -68,6 +72,37 @@ def create_app(upstream=UPSTREAM, transport=None):
         except (TypeError, ValueError):
             return value or ""
     app.jinja_env.filters["nice_date"] = nice_date
+
+    def nice_time(value):
+        """'23:59' -> '11:59 PM'; anything else is shown as-is."""
+        try:
+            return datetime.strptime(str(value), "%H:%M").strftime("%I:%M %p").lstrip("0")
+        except (TypeError, ValueError):
+            return value or ""
+    app.jinja_env.filters["nice_time"] = nice_time
+
+    # ── Due dates: stored locally, merged into the backend's assignment data ──
+    due_lock = threading.Lock()
+
+    def read_due():
+        try:
+            data = json.loads(Path(app.config["DUE_FILE"]).read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def write_due(data):
+        target = Path(app.config["DUE_FILE"])
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(target)
+
+    def with_due(items):
+        due = read_due()
+        for a in items:
+            if isinstance(a, dict):
+                a.update(due.get(str(a.get("id")), {}))
+        return items
 
     def exchange(path=None, method=None, body=None, extra_headers=None):
         path = path or request.full_path.rstrip("?")
@@ -240,7 +275,8 @@ def create_app(upstream=UPSTREAM, transport=None):
                 candidate = local_url(remote.headers.get(
                     "Location", "/"), app.config["UPSTREAM"])
                 if urlsplit(candidate).path in ("/student", "/instructor"):
-                    destination = "/courses" if urlsplit(candidate).path == "/instructor" else candidate
+                    destination = "/courses" if urlsplit(
+                        candidate).path == "/instructor" else candidate
             if destination:
                 response = jsonify(ok=True, next=destination) if request.is_json else redirect(
                     destination, 303)
@@ -289,10 +325,10 @@ def create_app(upstream=UPSTREAM, transport=None):
                     remote.close()
         return relay(exchange())
 
-    @app.route("/account")
+    # @app.route("/account")
     # @login_required
-    def account_page():
-        return render_template("account.html", anon=False)
+    # def account_page():
+    #    return render_template("account.html", anon=False)
 
     # ── Courses: read from the real backend with the visitor's own session ──
     def backend_json(path):
@@ -303,6 +339,20 @@ def create_app(upstream=UPSTREAM, transport=None):
             return remote.status_code, None
         finally:
             remote.close()
+
+    @app.route("/account")
+    def account_page():
+        status, data = backend_json("/api/me")
+        if status == 401 or not (isinstance(data, dict) and data.get("logged_in")):
+            return redirect("/login")
+        return render_template("account.html", anon=False)
+
+    @app.route("/help")
+    def help_page():
+        status, data = backend_json("/api/me")
+        if status == 401 or not (isinstance(data, dict) and data.get("logged_in")):
+            return redirect("/login")
+        return render_template("help.html", anon=False)
 
     def load_classes():
         """List of raw class dicts, or None when the visitor isn't logged in."""
@@ -316,7 +366,7 @@ def create_app(upstream=UPSTREAM, transport=None):
     def load_assignments(class_id):
         status, data = backend_json(
             "/api/instructor/assignments?class_id=" + quote(str(class_id)))
-        return data if status == 200 and isinstance(data, list) else []
+        return with_due(data) if status == 200 and isinstance(data, list) else []
 
     SHOWN = {"id", "title", "name", "due", "due_date", "due_at", "due_time", "points",
              "max_points", "status", "grade", "score", "description", "instructions"}
@@ -350,7 +400,8 @@ def create_app(upstream=UPSTREAM, transport=None):
         }
 
     def find_class(classes, course_id):
-        found = next((c for c in classes if str(c.get("id")) == str(course_id)), None)
+        found = next((c for c in classes if str(
+            c.get("id")) == str(course_id)), None)
         if found is None:
             abort(404)
         return found
@@ -375,7 +426,8 @@ def create_app(upstream=UPSTREAM, transport=None):
         name = (payload.get("name") or "").strip()
         if not name:
             return jsonify(ok=False, error="Class name is required."), 400
-        body = json.dumps({"name": name, "term": (payload.get("term") or "").strip()}).encode()
+        body = json.dumps({"name": name, "term": (
+            payload.get("term") or "").strip()}).encode()
         remote = exchange("/api/classes", "POST", body,
                           {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"})
         try:
@@ -414,14 +466,108 @@ def create_app(upstream=UPSTREAM, transport=None):
         return redirect(f"/instructor?class={quote(str(raw['id']))}"
                         f"&view=assignments&assignment={quote(str(assignment_id))}")
 
+    ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+    def due_parts(due, due_time):
+        """Backend due value -> ("YYYY-MM-DD", "11:59 PM" or None), or (None, None)."""
+        text = str(due or "").strip()
+        day = text[:10]
+        if not ISO_DATE.match(day):
+            return None, None
+        time_label = nice_time(due_time) if due_time else None
+        # e.g. 2026-10-20T23:59:00
+        if not time_label and len(text) > 10:
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                time_label = parsed.strftime("%I:%M %p").lstrip("0")
+            except ValueError:
+                pass
+        return day, time_label
+
     @app.route("/calendar")
-    # @login_required
     def calendar_page():
-        events = [
-            # Replace with a real query. "title" and "date" (YYYY-MM-DD) are required.
-            # {"title": "Lab 3 due", "date": "2026-10-20", "time": "11:59 PM", "course": "CS 101"},
-        ]
-        return render_template("calendar.html", anon=False, events=events)
+        status, me = backend_json("/api/me")
+        if status == 401 or not (isinstance(me, dict) and me.get("logged_in")):
+            return redirect("/login")
+        is_instructor = me.get("role") == "instructor"
+
+        classes = load_classes()
+        if classes is None:
+            return redirect("/login")
+
+        events = []
+        for c in classes:
+            course = shape_course(c, load_assignments(c["id"]))
+            label = course["code"] or course["name"]
+            for a in course["assignments"]:
+                day, time_label = due_parts(a["due"], a["due_time"])
+                if not day:
+                    continue                      # no usable due date -> not on the calendar
+                events.append({
+                    "title": a["title"],
+                    "date": day,
+                    "time": time_label,
+                    "course": label,
+                    "type": "assignment",
+                })
+
+        # The usage heatmap is loaded by the page from /api/calendar/usage (instructors only).
+        return render_template("calendar.html", anon=False, events=events,
+                               usage={}, is_instructor=is_instructor)
+
+    # ── Assignment due dates (no backend, so handled here) ──
+    @app.get("/api/instructor/assignments")
+    def assignments_with_due():
+        """Same data the backend returns, plus any locally stored due dates."""
+        qs = request.query_string.decode()
+        status, data = backend_json(
+            "/api/instructor/assignments" + ("?" + qs if qs else ""))
+        if status != 200 or not isinstance(data, list):
+            return jsonify(ok=False, error="Could not load assignments."), (status if status >= 400 else 502)
+        return jsonify(with_due(data))
+
+    @app.patch("/api/instructor/assignments/<assignment_id>")
+    def assignment_patch(assignment_id):
+        payload = request.get_json(silent=True) or {}
+        if not any(k in payload for k in ("due", "due_date", "due_time")):
+            # renames etc. go straight to the backend
+            return relay(exchange())
+
+        status, me = backend_json("/api/me")
+        if not (isinstance(me, dict) and me.get("logged_in") and me.get("role") == "instructor"):
+            return jsonify(ok=False, error="Not allowed."), 403
+        try:
+            day = str(payload.get("due_date") or payload.get(
+                "due") or "").strip()[:10] or None
+            time_value = str(payload.get("due_time") or "").strip() or None
+            if day:
+                datetime.strptime(day, "%Y-%m-%d")
+            if time_value:
+                datetime.strptime(time_value, "%H:%M")
+        except ValueError:
+            return jsonify(ok=False, error="Invalid date or time."), 400
+
+        with due_lock:
+            stored = read_due()
+            if day:
+                stored[str(assignment_id)] = {
+                    "due_date": day, "due_time": time_value if day else None}
+            else:
+                stored.pop(str(assignment_id), None)
+            write_due(stored)
+
+        # Anything else in the same PATCH (e.g. a title) still goes to the backend.
+        rest = {k: v for k, v in payload.items() if k not in (
+            "due", "due_date", "due_time")}
+        if rest:
+            remote = exchange(f"/api/instructor/assignments/{quote(str(assignment_id))}", "PATCH",
+                              json.dumps(rest).encode(), {"Content-Type": "application/json"})
+            try:
+                if remote.status_code >= 400:
+                    return relay(remote)
+            finally:
+                remote.close()
+        return jsonify(ok=True)
 
     return app
 
